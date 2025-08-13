@@ -21,6 +21,12 @@ try:
 except Exception:
     joblib = None
 
+import os, sys, time
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+def log(msg):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
 
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
@@ -45,16 +51,20 @@ class ClinicalMLP(torch.nn.Module):
 
 
 def run():
-    interface_key = get_interface_key()
-    handler = {
-        (
-            "bladder-cancer-tissue-biopsy-whole-slide-image",
-            "bulk-rna-seq-bladder-cancer",
-            "chimera-clinical-data-of-bladder-cancer-recurrence",
-            "tissue-mask",
-        ): interf0_handler,
-    }[interface_key]
-    return handler()
+    interface_key = set(get_interface_key())  # set, not tuple
+    required = {
+        "bladder-cancer-tissue-biopsy-whole-slide-image",
+        "bulk-rna-seq-bladder-cancer",
+        "chimera-clinical-data-of-bladder-cancer-recurrence",
+        "tissue-mask",
+    }
+    if required.issubset(interface_key):
+        return interf0_handler()
+    # Fallback: clinical-only path if only clinical present
+    if {"chimera-clinical-data-of-bladder-cancer-recurrence"}.issubset(interface_key):
+        return interf0_handler()  # (still clinical-only)
+    raise RuntimeError(f"Unexpected interface slugs: {sorted(interface_key)}")
+
 
 
 def interf0_handler():
@@ -84,6 +94,12 @@ def interf0_handler():
 
     model_type, weights_path = _find_best_artifact(RESOURCE_PATH)
     if weights_path is None:
+        log("No model artifact found under resources/ ; writing default low risk and exiting.")
+        write_json_file(OUTPUT_PATH / "likelihood-of-bladder-cancer-recurrence.json",
+                        {"likelihood": 0.0})
+        return 0
+    log(f"Selected artifact: {weights_path} ({model_type})")
+    if weights_path is None:
         raise FileNotFoundError(f"No model artifact found in {RESOURCE_PATH}")
     print(f"Selected artifact: type={model_type}, path={weights_path}")
 
@@ -109,10 +125,35 @@ def interf0_handler():
         if joblib is None:
             raise RuntimeError("joblib is required to load the saved model but is not available")
         model = joblib.load(weights_path)
-        # Try to infer required input dimension; fallback to 512
-        clinical_dim = getattr(model, "n_features_", None) or 512
-        clinical_vec = _vectorize_clinical(clinical_json, int(clinical_dim))
-        risk_score = float(model.predict(clinical_vec.reshape(1, -1))[0])
+
+        # If a preprocessor is available in resources, use it to transform a 1-row DataFrame
+        preproc_path = RESOURCE_PATH / "preprocessor.joblib"
+        if preproc_path.exists():
+            preprocessor = joblib.load(preproc_path)
+            # Build a 1-row DataFrame with expected columns, filling from clinical_json
+            try:
+                import pandas as pd  # Local import to avoid hard dependency otherwise
+                expected_cols = list(getattr(preprocessor, "feature_names_in_", []))
+                if not expected_cols:
+                    # Fallback: use keys from clinical_json
+                    expected_cols = sorted(list(clinical_json.keys()))
+                row = {}
+                for col in expected_cols:
+                    val = clinical_json.get(col)
+                    row[col] = val if isinstance(val, (int, float, str, bool)) else str(val)
+                X_df = pd.DataFrame([row], columns=expected_cols)
+            except Exception:
+                # As a safe fallback, use hashing vectorization to the model's expected feature width
+                n_in = getattr(model, "n_features_in_", None) or getattr(model, "n_features_", None) or 512
+                X = _vectorize_clinical(clinical_json, int(n_in)).reshape(1, -1)
+            else:
+                X = preprocessor.transform(X_df)
+        else:
+            # No preprocessor available: use hashing vector of required width
+            n_in = getattr(model, "n_features_in_", None) or getattr(model, "n_features_", None) or 512
+            X = _vectorize_clinical(clinical_json, int(n_in)).reshape(1, -1)
+
+        risk_score = float(model.predict(X)[0])
 
     else:
         raise RuntimeError(f"Unsupported model artifact type: {model_type}")
@@ -120,10 +161,13 @@ def interf0_handler():
     prob = 1.0 / (1.0 + math.exp(-risk_score))
     output_likelihood_of_bladder_cancer_recurrence = round(80.0 * prob, 1)
 
+    # instead of writing a bare number
     write_json_file(
         location=OUTPUT_PATH / "likelihood-of-bladder-cancer-recurrence.json",
-        content=output_likelihood_of_bladder_cancer_recurrence,
+        content={"likelihood": output_likelihood_of_bladder_cancer_recurrence}
     )
+    log("Wrote output JSON with key 'likelihood'")
+
     return 0
 
 
@@ -249,4 +293,13 @@ def _find_best_artifact(resources_dir: Path) -> tuple[str, Path | None]:
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    try:
+        log("START inference.py")
+        rc = run()
+        log(f"END inference.py rc={rc}")
+        raise SystemExit(rc)
+    except Exception as e:
+        import traceback
+        print("FATAL ERROR:", e, file=sys.stderr, flush=True)
+        traceback.print_exc()
+        raise SystemExit(2)
