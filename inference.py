@@ -227,11 +227,6 @@ def _find_best_artifact(resources_dir: Path) -> tuple[str, Path | None]:
         except Exception:
             pass
 
-    # 2) Preferred single-file MLP
-    preferred_pt = resources_dir / "clinical_mlp.pt"
-    if preferred_pt.exists():
-        return "pt", preferred_pt
-
     # 3) Any PT checkpoints
     pt_candidates = sorted(
         [p for p in resources_dir.glob("*.pt") if p.is_file()],
