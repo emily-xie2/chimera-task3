@@ -1,0 +1,5 @@
+{
+  "model": "RSF (clinical)",
+  "c_index": 0.75,
+  "artifact": "best_model_fold2.joblib"
+}
