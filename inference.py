@@ -1,305 +1,239 @@
 """
-Clinical-only inference script.
+The following is a simple example algorithm.
 
-Loads clinical JSON input and model artifacts from resources/ only. Supports:
-- PyTorch MLP checkpoints (*.pt) saved as state_dict
-- Joblib models (*.joblib), e.g., RandomSurvivalForest
+It is meant to run within a container.
 
-No RNA-seq or histopathology inputs are loaded.
+To run the container locally, you can call the following bash script:
+
+  ./do_test_run.sh
+
+This will start the inference and reads from ./test/input and writes to ./test/output
+
+To save the container and prep it for upload to Grand-Challenge.org you can call:
+
+  ./do_save.sh
+
+Any container that shows the same behaviour will do, this is purely an example of how one COULD do it.
+
+Reference the documentation to get details on the runtime environment on the platform:
+https://grand-challenge.org/documentation/runtime-environment/
+
+Happy programming!
 """
 
 from pathlib import Path
-import os
 import json
-import math
-import hashlib
-import numpy
 import torch
-
-try:
-    import joblib  # For scikit-survival models if present
-except Exception:
-    joblib = None
-
-import os, sys, time
-os.environ.setdefault("PYTHONUNBUFFERED", "1")
-
-def log(msg):
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
-
+import torch.nn as nn
 
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
 RESOURCE_PATH = Path("resources")
 
 
-class ClinicalMLP(torch.nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.4):
-        super().__init__()
-        self.network = torch.nn.Sequential(
-            torch.nn.Linear(input_dim, hidden_dim),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_dim, hidden_dim // 2),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_dim // 2, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)
-
-
 def run():
-    interface_key = set(get_interface_key())  # set, not tuple
-    required = {
-        "bladder-cancer-tissue-biopsy-whole-slide-image",
-        "bulk-rna-seq-bladder-cancer",
-        "chimera-clinical-data-of-bladder-cancer-recurrence",
-        "tissue-mask",
-    }
-    if required.issubset(interface_key):
-        return interf0_handler()
-    # Fallback: clinical-only path if only clinical present
-    if {"chimera-clinical-data-of-bladder-cancer-recurrence"}.issubset(interface_key):
-        return interf0_handler()  # (still clinical-only)
-    raise RuntimeError(f"Unexpected interface slugs: {sorted(interface_key)}")
+    # The key is a tuple of the slugs of the input sockets
+    interface_key = get_interface_key()
 
+    # Lookup the handler for this particular set of sockets (i.e. the interface)
+    handler = {
+        (
+            "bladder-cancer-tissue-biopsy-whole-slide-image",
+            "bulk-rna-seq-bladder-cancer",
+            "chimera-clinical-data-of-bladder-cancer-recurrence",
+            "tissue-mask",
+        ): interf0_handler,
+    }[interface_key]
+
+    # Call the handler
+    return handler()
 
 
 def interf0_handler():
-    # # Read the input - use thumbnail loading for tissue mask to avoid memory issues with large WSI tissue masks
-    # input_tissue_mask = load_image_file_as_thumbnail(
-    #     location=INPUT_PATH / "images/tissue-mask",
-    #     max_size=1024,
-    # )
-    # # Use thumbnail loading for large WSI to avoid memory issues
-    # input_bladder_cancer_tissue_biopsy_whole_slide_image = load_image_file_as_thumbnail(
-    #     location=INPUT_PATH / "images/bladder-cancer-tissue-biopsy-wsi",
-    #     max_size=1024,
-    # )
-    # input_bulk_rna_seq_bladder_cancer = load_json_file(
-    #     location=INPUT_PATH / "bulk-rna-seq-bladder-cancer.json",
-    # )
-    # input_chimera_clinical_data_of_bladder_cancer_recurrence = load_json_file(
-    #     location=INPUT_PATH
-    #     / "chimera-clinical-data-of-bladder-cancer-recurrence-patients.json",
-    clinical_json = load_json_file(
-        location=INPUT_PATH / "chimera-clinical-data-of-bladder-cancer-recurrence-patients.json"
+    """
+    Clinical-only inference handler. Reads clinical JSON, encodes features,
+    runs a small MLP (weights loaded if available), and writes likelihood [0, 100].
+    """
+    _show_torch_cuda_info()
+
+    clinical = load_json_file(
+        location=INPUT_PATH / "chimera-clinical-data-of-bladder-cancer-recurrence-patients.json",
     )
 
-    _show_torch_cuda_info()
+    x = encode_clinical(clinical)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
-    model_type, weights_path = _find_best_artifact(RESOURCE_PATH)
-    if weights_path is None:
-        log("No model artifact found under resources/ ; writing default low risk and exiting.")
-        write_json_file(OUTPUT_PATH / "likelihood-of-bladder-cancer-recurrence.json",
-                        {"likelihood": 0.0})
-        return 0
-    log(f"Selected artifact: {weights_path} ({model_type})")
-    if weights_path is None:
-        raise FileNotFoundError(f"No model artifact found in {RESOURCE_PATH}")
-    print(f"Selected artifact: type={model_type}, path={weights_path}")
-
-    # Vectorize clinical JSON to expected input shape
-    if model_type == "pt":
-        state = torch.load(weights_path, map_location="cpu")
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
-        clinical_dim, hidden_dim = _infer_clinical_dims_from_state(state)
-        print(f"Inferred MLP dims -> clinical_dim={clinical_dim}, hidden_dim={hidden_dim}")
-
-        model = ClinicalMLP(input_dim=clinical_dim, hidden_dim=hidden_dim, dropout=0.4)
-        model.load_state_dict(state, strict=True)
-        model.to(device)
-        model.eval()
-
-        clinical_vec = _vectorize_clinical(clinical_json, clinical_dim)
-        with torch.no_grad():
-            c_tensor = torch.from_numpy(clinical_vec).unsqueeze(0).float().to(device)
-            risk_score = float(model(c_tensor).squeeze().item())
-
-    elif model_type == "joblib":
-        if joblib is None:
-            raise RuntimeError("joblib is required to load the saved model but is not available")
-        model = joblib.load(weights_path)
-
-        # If a preprocessor is available in resources, use it to transform a 1-row DataFrame
-        preproc_path = RESOURCE_PATH / "preprocessor.joblib"
-        if preproc_path.exists():
-            preprocessor = joblib.load(preproc_path)
-            # Build a 1-row DataFrame with expected columns, filling from clinical_json
-            try:
-                import pandas as pd  # Local import to avoid hard dependency otherwise
-                expected_cols = list(getattr(preprocessor, "feature_names_in_", []))
-                if not expected_cols:
-                    # Fallback: use keys from clinical_json
-                    expected_cols = sorted(list(clinical_json.keys()))
-                row = {}
-                for col in expected_cols:
-                    val = clinical_json.get(col)
-                    row[col] = val if isinstance(val, (int, float, str, bool)) else str(val)
-                X_df = pd.DataFrame([row], columns=expected_cols)
-            except Exception:
-                # As a safe fallback, use hashing vectorization to the model's expected feature width
-                n_in = getattr(model, "n_features_in_", None) or getattr(model, "n_features_", None) or 512
-                X = _vectorize_clinical(clinical_json, int(n_in)).reshape(1, -1)
-            else:
-                X = preprocessor.transform(X_df)
-        else:
-            # No preprocessor available: use hashing vector of required width
-            n_in = getattr(model, "n_features_in_", None) or getattr(model, "n_features_", None) or 512
-            X = _vectorize_clinical(clinical_json, int(n_in)).reshape(1, -1)
-
-        risk_score = float(model.predict(X)[0])
-
+    # Try loading trained weights and infer model dims if available
+    load_result = _load_trained_weights()
+    if load_result is not None:
+        state_dict, inferred_in_dim, inferred_hidden_dim = load_result
+        model = ClinicalMLP(input_dim=inferred_in_dim, hidden_dim=inferred_hidden_dim, dropout=0.4)
+        model.load_state_dict(state_dict)
     else:
-        raise RuntimeError(f"Unsupported model artifact type: {model_type}")
+        model = ClinicalMLP(input_dim=x.shape[0], hidden_dim=64, dropout=0.4)
 
-    prob = 1.0 / (1.0 + math.exp(-risk_score))
-    output_likelihood_of_bladder_cancer_recurrence = round(80.0 * prob, 1)
+    # Adjust input feature vector to expected dimension (pad with zeros or truncate)
+    expected_in = model.fc1.in_features
+    if x.shape[0] < expected_in:
+        pad = torch.zeros(expected_in - x.shape[0], dtype=x.dtype)
+        x = torch.cat([x, pad], dim=0)
+    elif x.shape[0] > expected_in:
+        x = x[:expected_in]
 
-    # instead of writing a bare number
+    x = x.unsqueeze(0).to(device)
+    model.to(device)
+    model.eval()
+
+    with torch.no_grad():
+        logits = model(x)
+        prob = torch.sigmoid(logits).item()
+        likelihood = round(float(prob) * 100.0, 1)
+
     write_json_file(
         location=OUTPUT_PATH / "likelihood-of-bladder-cancer-recurrence.json",
-        content={"likelihood": output_likelihood_of_bladder_cancer_recurrence}
+        content=likelihood,
     )
-    log("Wrote output JSON with key 'likelihood'")
 
     return 0
 
 
 def get_interface_key():
-    inputs = load_json_file(location=INPUT_PATH / "inputs.json")
+    # The inputs.json is a system generated file that contains information about
+    # the inputs that interface with the algorithm
+    inputs = load_json_file(
+        location=INPUT_PATH / "inputs.json",
+    )
     socket_slugs = [sv["interface"]["slug"] for sv in inputs]
     return tuple(sorted(socket_slugs))
 
 
 def load_json_file(*, location):
+    # Reads a json file
     with open(location, "r") as f:
         return json.loads(f.read())
 
 
 def write_json_file(*, location, content):
+    # Writes a json file
     with open(location, "w") as f:
         f.write(json.dumps(content, indent=4))
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+class ClinicalMLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int = 64, dropout: float = 0.4):
+        super().__init__()
+        # Match utils.models.mlp.PredictionModel_Clinical architecture
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.relu1 = nn.ReLU()
+        self.drop1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.relu2 = nn.ReLU()
+        self.drop2 = nn.Dropout(dropout)
+        self.out = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.relu1(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = self.relu2(x)
+        x = self.drop2(x)
+        x = self.out(x)
+        return x
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
+def _load_trained_weights():
+    """
+    Search for a saved state_dict and infer model dimensions from the first layer
+    weights. Returns (state_dict, input_dim, hidden_dim) or None.
+    """
+    candidate_paths = [
+        Path("/opt/app/resources") / "clinical_mlp.pt",
+        RESOURCE_PATH / "clinical_mlp.pt",
+    ]
+    for p in candidate_paths:
+        if not p.exists():
+            continue
+        try:
+            print(f"Found clinical model weights at: {p}")
+            state = torch.load(p, map_location="cpu")
+            # Try common key patterns to infer dimensions
+            key_options = [
+                "network.0.weight",   # utils.models.mlp.PredictionModel_Clinical
+                "fc1.weight",         # this module naming
+            ]
+            for k in key_options:
+                if k in state:
+                    w = state[k]
+                    hidden_dim, in_dim = int(w.shape[0]), int(w.shape[1])
+                    return state, in_dim, hidden_dim
+            # Fallback: try to parse any first Linear weight
+            for k, v in state.items():
+                if k.endswith(".weight") and len(v.shape) == 2:
+                    hidden_dim, in_dim = int(v.shape[0]), int(v.shape[1])
+                    return state, in_dim, hidden_dim
+            print(f"Warning: could not infer model dims from state dict keys at {p}")
+        except Exception as e:
+            print(f"Warning: failed to load/inspect weights from {p}: {e}")
+    print("No clinical model weights found.")
+    return None
+
+
+def encode_clinical(cd):
+    """
+    One-hot encodes categorical clinical features and appends normalized numerical features.
+    """
+    cat_map = {
+        "sex": ["Male", "Female"],
+        "smoking": ["No", "Yes"],
+        "tumor": ["Primary", "Recurrence"],
+        "stage": ["TaHG", "T1HG", "T2HG"],
+        "substage": ["T1m", "T1e"],
+        "grade": ["G2", "G3"],
+        "reTUR": ["No", "Yes"],
+        "LVI": ["No", "Yes"],
+        "variant": ["UCC", "UCC + Variant"],
+        "EORTC": ["High risk", "Highest risk"],
+        "BRS": ["BRS1", "BRS2", "BRS3"],
+    }
+
+    one_hot = []
+    for key, options in cat_map.items():
+        vec = [0] * len(options)
+        value = cd.get(key, None)
+        if value in options:
+            vec[options.index(value)] = 1
+        else:
+            vec[0] = 1
+        one_hot.extend(vec)
+
+    # Numerical features (simple normalization/scaling)
     try:
-        return int(raw)
+        age = float(cd.get("age", 0.0)) / 100.0
     except Exception:
-        return default
+        age = 0.0
+    try:
+        instills = float(cd.get("no_instillations", -1.0))
+    except Exception:
+        instills = -1.0
+
+    numerical = [age, instills]
+
+    return torch.tensor(numerical + one_hot, dtype=torch.float32)
 
 
 def _show_torch_cuda_info():
+    import torch
+
     print("=+=" * 10)
     print("Collecting Torch CUDA information")
     print(f"Torch CUDA is available: {(available := torch.cuda.is_available())}")
     if available:
         print(f"\tnumber of devices: {torch.cuda.device_count()}")
-        current_device = torch.cuda.current_device()
-        print(f"\tcurrent device: {current_device}")
+        print(f"\tcurrent device: { (current_device := torch.cuda.current_device())}")
         print(f"\tproperties: {torch.cuda.get_device_properties(current_device)}")
     print("=+=" * 10)
 
 
-def _infer_clinical_dims_from_state(state_dict: dict) -> tuple[int, int]:
-    w0 = state_dict["network.0.weight"]  # [hidden_dim, input_dim]
-    hidden_dim = int(w0.shape[0])
-    clinical_dim = int(w0.shape[1])
-    w3 = state_dict.get("network.3.weight")
-    if w3 is not None:
-        assert int(w3.shape[1]) == hidden_dim, "Mismatch in hidden layer size"
-    return clinical_dim, hidden_dim
-
-
-def _stable_index(key: str, dim: int) -> int:
-    h = hashlib.md5(key.encode("utf-8")).hexdigest()
-    return int(h, 16) % dim
-
-
-def _vectorize_clinical(clinical_json: dict, dim: int) -> numpy.ndarray:
-    vec = numpy.zeros(dim, dtype=numpy.float32)
-    if not isinstance(clinical_json, dict):
-        return vec
-    for k, v in clinical_json.items():
-        if isinstance(v, (int, float)) and math.isfinite(float(v)):
-            idx = _stable_index(k, dim)
-            vec[idx] += float(v)
-        else:
-            idx = _stable_index(f"{k}={v}", dim)
-            vec[idx] += 1.0
-    return vec
-
-
-def _find_best_artifact(resources_dir: Path) -> tuple[str, Path | None]:
-    """Select a best-available artifact under resources/.
-
-    Priority:
-    - best_model_*.json -> read artifact name inside, prefer .pt/.joblib listed
-    - clinical_mlp.pt
-    - most recent best_model_*.pt or clinical_mlp_fold*.pt
-    - most recent *.joblib
-    Returns: (type, path) where type in {"pt", "joblib"}
-    """
-    # 1) Metadata JSON
-    meta_files = sorted(resources_dir.glob("best_model_*.json"))
-    for meta in meta_files:
-        try:
-            data = json.loads(meta.read_text())
-            artifact = data.get("artifact")
-            if artifact:
-                p = resources_dir / artifact
-                if p.exists():
-                    if p.suffix == ".pt":
-                        return "pt", p
-                    if p.suffix == ".joblib":
-                        return "joblib", p
-        except Exception:
-            pass
-
-    # 3) Any PT checkpoints
-    pt_candidates = sorted(
-        [p for p in resources_dir.glob("*.pt") if p.is_file()],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if pt_candidates:
-        return "pt", pt_candidates[0]
-
-    # 4) Any joblib models
-    joblib_candidates = sorted(
-        [p for p in resources_dir.glob("*.joblib") if p.is_file()],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if joblib_candidates:
-        return "joblib", joblib_candidates[0]
-
-    return "", None
-
-
 if __name__ == "__main__":
-    try:
-        log("START inference.py")
-        rc = run()
-        log(f"END inference.py rc={rc}")
-        raise SystemExit(rc)
-    except Exception as e:
-        import traceback
-        print("FATAL ERROR:", e, file=sys.stderr, flush=True)
-        traceback.print_exc()
-        raise SystemExit(2)
+    raise SystemExit(run())
