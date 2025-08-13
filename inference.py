@@ -81,6 +81,29 @@ class LateFusionMLP(torch.nn.Module):
         return self.head(fused)
 
 
+class ClinicalMLP(torch.nn.Module):
+    """Clinical-only MLP matching training architecture.
+
+    Architecture: Linear(input_dim -> hidden_dim) -> ReLU -> Dropout ->
+                  Linear(hidden_dim -> hidden_dim//2) -> ReLU -> Dropout ->
+                  Linear(hidden_dim//2 -> 1)
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.4):
+        super().__init__()
+        self.network = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim, hidden_dim // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+
+
 def _infer_model_dims_from_state(state_dict: dict) -> tuple[int, int, int, int]:
     """Infer (clinical_dim, rna_dim, embed_dim, hidden_dim) from state shapes."""
     # clinical encoder first and second linear layers
@@ -97,6 +120,17 @@ def _infer_model_dims_from_state(state_dict: dict) -> tuple[int, int, int, int]:
     rna_dim = w_r0.shape[1]
     assert w_h0.shape[1] == 2 * embed_dim, "Head expects 2*embed_dim inputs"
     return clinical_dim, rna_dim, embed_dim, hidden_dim
+
+
+def _infer_clinical_dims_from_state(state_dict: dict) -> tuple[int, int]:
+    """Infer (clinical_dim, hidden_dim) from clinical-only state shapes."""
+    w0 = state_dict["network.0.weight"]  # [hidden_dim, input_dim]
+    w3 = state_dict.get("network.3.weight")  # [hidden_dim//2, hidden_dim]
+    hidden_dim = w0.shape[0]
+    clinical_dim = w0.shape[1]
+    if w3 is not None:
+        assert w3.shape[1] == hidden_dim, "Mismatch in hidden layer size"
+    return clinical_dim, hidden_dim
 
 
 def _stable_index(key: str, dim: int) -> int:
@@ -157,53 +191,36 @@ def run():
 
 
 def interf0_handler():
-    # Load inputs we may want to log; actual prediction uses JSONs
-    if _env_flag("CHIMERA_LOAD_WSI_THUMBNAILS", False):
-        try:
-            thumb_size = _env_int("CHIMERA_THUMBNAIL_SIZE", 512)
-            _ = load_image_file_as_thumbnail(location=INPUT_PATH / "images/tissue-mask", max_size=thumb_size)
-            _ = load_image_file_as_thumbnail(location=INPUT_PATH / "images/bladder-cancer-tissue-biopsy-wsi", max_size=thumb_size)
-        except Exception as e:
-            print(f"Image thumbnail load warning: {e}")
-
-    rna_json = load_json_file(location=INPUT_PATH / "bulk-rna-seq-bladder-cancer.json")
     clinical_json = load_json_file(
         location=INPUT_PATH / "chimera-clinical-data-of-bladder-cancer-recurrence-patients.json"
     )
 
     _show_torch_cuda_info()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    # Load weights and reconstruct model
-    weights_path = RESOURCE_PATH / "late_fusion.pt"
+    # Load clinical-only weights and reconstruct model
+    weights_path = RESOURCE_PATH / "clinical_mlp.pt"
     if not weights_path.exists():
         raise FileNotFoundError(f"Model weights not found at {weights_path}")
     state = torch.load(weights_path, map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
 
-    clinical_dim, rna_dim, embed_dim, hidden_dim = _infer_model_dims_from_state(state)
-    print(
-        f"Inferred dims -> clinical_dim={clinical_dim}, rna_dim={rna_dim}, embed_dim={embed_dim}, hidden_dim={hidden_dim}"
-    )
+    clinical_dim, hidden_dim = _infer_clinical_dims_from_state(state)
+    print(f"Inferred clinical dims -> clinical_dim={clinical_dim}, hidden_dim={hidden_dim}")
 
-    model = LateFusionMLP(
-        clinical_dim=clinical_dim,
-        rna_dim=rna_dim,
-        embed_dim=embed_dim,
-        hidden_dim=hidden_dim,
-        dropout=0.0,
-    )
-    model.load_state_dict(state)
+    model = ClinicalMLP(input_dim=clinical_dim, hidden_dim=hidden_dim, dropout=0.4)
+    model.load_state_dict(state, strict=True)
+    model.to(device)
     model.eval()
 
-    # Vectorize inputs via deterministic hashing to match expected dims
+    # Vectorize clinical inputs via deterministic hashing to match expected dims
     clinical_vec = _vectorize_clinical(clinical_json, clinical_dim)
-    rna_vec = _vectorize_rna(rna_json, rna_dim)
 
     with torch.no_grad():
-        c_tensor = torch.from_numpy(clinical_vec).unsqueeze(0).float()
-        r_tensor = torch.from_numpy(rna_vec).unsqueeze(0).float()
-        risk_score = model(c_tensor, r_tensor).squeeze().item()
+        c_tensor = torch.from_numpy(clinical_vec).unsqueeze(0).float().to(device)
+        risk_score = model(c_tensor).squeeze().item()
 
     # Map risk_score to [0, 80] using sigmoid
     prob = 1.0 / (1.0 + math.exp(-risk_score))
