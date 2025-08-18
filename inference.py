@@ -30,6 +30,8 @@ import math
 import pyvips
 import numpy
 import torch
+import joblib
+import pandas as pd
 
 
 INPUT_PATH = Path("/input")
@@ -104,6 +106,25 @@ class ClinicalMLP(torch.nn.Module):
         return self.network(x)
 
 
+class ClinicalMLPExported(torch.nn.Module):
+    """Clinical MLP architecture matching exported state keys (fc1/fc2/out)."""
+    def __init__(self, input_dim: int, hidden1_dim: int, hidden2_dim: int, dropout: float = 0.4):
+        super().__init__()
+        self.fc1 = torch.nn.Linear(input_dim, hidden1_dim)
+        self.dropout1 = torch.nn.Dropout(dropout)
+        self.fc2 = torch.nn.Linear(hidden1_dim, hidden2_dim)
+        self.dropout2 = torch.nn.Dropout(dropout)
+        self.out = torch.nn.Linear(hidden2_dim, 1)
+        self.act = torch.nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act(self.fc1(x))
+        x = self.dropout1(x)
+        x = self.act(self.fc2(x))
+        x = self.dropout2(x)
+        return self.out(x)
+
+
 def _infer_model_dims_from_state(state_dict: dict) -> tuple[int, int, int, int]:
     """Infer (clinical_dim, rna_dim, embed_dim, hidden_dim) from state shapes."""
     # clinical encoder first and second linear layers
@@ -131,6 +152,18 @@ def _infer_clinical_dims_from_state(state_dict: dict) -> tuple[int, int]:
     if w3 is not None:
         assert w3.shape[1] == hidden_dim, "Mismatch in hidden layer size"
     return clinical_dim, hidden_dim
+
+
+def _infer_exported_clinical_dims(state_dict: dict) -> tuple[int, int, int]:
+    """Infer (input_dim, hidden1_dim, hidden2_dim) from exported clinical MLP state."""
+    w1 = state_dict["fc1.weight"]  # [hidden1_dim, input_dim]
+    w2 = state_dict["fc2.weight"]  # [hidden2_dim, hidden1_dim]
+    w3 = state_dict["out.weight"]  # [1, hidden2_dim]
+    input_dim = w1.shape[1]
+    hidden1_dim = w1.shape[0]
+    hidden2_dim = w2.shape[0]
+    assert w2.shape[1] == hidden1_dim and w3.shape[1] == hidden2_dim
+    return input_dim, hidden1_dim, hidden2_dim
 
 
 def _stable_index(key: str, dim: int) -> int:
@@ -199,32 +232,71 @@ def interf0_handler():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load clinical-only weights and reconstruct model
+    # Load resources: fitted preprocessor and exported clinical MLP weights
+    preproc_path = RESOURCE_PATH / "clinical_preprocessor.joblib"
     weights_path = RESOURCE_PATH / "clinical_mlp.pt"
-    if not weights_path.exists():
-        raise FileNotFoundError(f"Model weights not found at {weights_path}")
+    if not preproc_path.exists() or not weights_path.exists():
+        raise FileNotFoundError(
+            f"Required resources not found. Expected both {preproc_path} and {weights_path}"
+        )
+
+    preprocessor = joblib.load(preproc_path)
     state = torch.load(weights_path, map_location="cpu")
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
 
-    clinical_dim, hidden_dim = _infer_clinical_dims_from_state(state)
-    print(f"Inferred clinical dims -> clinical_dim={clinical_dim}, hidden_dim={hidden_dim}")
+    in_dim, hid1, hid2 = _infer_exported_clinical_dims(state)
+    print(f"Loaded resources: preprocessor + clinical MLP (in={in_dim}, h1={hid1}, h2={hid2})")
 
-    model = ClinicalMLP(input_dim=clinical_dim, hidden_dim=hidden_dim, dropout=0.4)
+    model = ClinicalMLPExported(input_dim=in_dim, hidden1_dim=hid1, hidden2_dim=hid2, dropout=0.4)
     model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
 
-    # Vectorize clinical inputs via deterministic hashing to match expected dims
-    clinical_vec = _vectorize_clinical(clinical_json, clinical_dim)
+    # Build a single-row DataFrame with expected raw columns for the preprocessor
+    expected_cols = []
+    for name, trans, cols in getattr(preprocessor, "transformers_", []):
+        if isinstance(cols, (list, tuple)):
+            expected_cols.extend(cols)
+    row = {col: clinical_json.get(col, None) for col in expected_cols}
+    df_one = pd.DataFrame([row])
+    X = preprocessor.transform(df_one)
+    assert X.shape[1] == in_dim, "Preprocessor output dim does not match model input dim"
 
     with torch.no_grad():
-        c_tensor = torch.from_numpy(clinical_vec).unsqueeze(0).float().to(device)
-        risk_score = model(c_tensor).squeeze().item()
+        c_tensor = torch.from_numpy(X).float().to(device)
+        risk_mlp = float(model(c_tensor).squeeze().item())
 
-    # Map risk_score to [0, 80] using sigmoid
-    prob = 1.0 / (1.0 + math.exp(-risk_score))
-    output_likelihood_of_bladder_cancer_recurrence = round(80.0 * prob, 1)
+    # Primary output from MLP
+    prob_mlp = 1.0 / (1.0 + math.exp(-risk_mlp))
+    final_output = round(80.0 * prob_mlp, 1)
+
+    # Optional: refine via CoxStack meta-learner if available
+    coxstack_path = RESOURCE_PATH / "coxstack.joblib"
+    if coxstack_path.exists():
+        try:
+            bundle = joblib.load(coxstack_path)
+            aligned_keys = bundle["aligned_keys"]
+            scaler = bundle["scaler"]
+            meta = bundle["meta"]
+            # Compose meta features in aligned order; unknowns filled with scaler mean
+            raw = numpy.zeros(len(aligned_keys), dtype=numpy.float32)
+            key_to_val = {"mlp": risk_mlp}
+            for i, k in enumerate(aligned_keys):
+                v = key_to_val.get(k)
+                if v is None and hasattr(scaler, "mean_"):
+                    raw[i] = float(scaler.mean_[i])
+                elif v is None:
+                    raw[i] = 0.0
+                else:
+                    raw[i] = float(v)
+            raw = raw.reshape(1, -1)
+            raw_s = scaler.transform(raw)
+            risk_meta = float(meta.predict(raw_s).ravel()[0])
+            prob_meta = 1.0 / (1.0 + math.exp(-risk_meta))
+            final_output = round(80.0 * prob_meta, 1)
+        except Exception as e:
+            print(f"CoxStack inference failed ({e}); falling back to MLP output")
+
+    output_likelihood_of_bladder_cancer_recurrence = final_output
 
     write_json_file(
         location=OUTPUT_PATH / "likelihood-of-bladder-cancer-recurrence.json",
