@@ -200,28 +200,30 @@ def interf0_handler():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load clinical-only weights and reconstruct model
+    # Optionally load clinical-only MLP if present
+    mlp_risk_score = None
     weights_path = RESOURCE_PATH / "clinical_mlp.pt"
-    if not weights_path.exists():
-        raise FileNotFoundError(f"Model weights not found at {weights_path}")
-    state = torch.load(weights_path, map_location="cpu")
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
+    if weights_path.exists():
+        state = torch.load(weights_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
 
-    clinical_dim, hidden_dim = _infer_clinical_dims_from_state(state)
-    print(f"Inferred clinical dims -> clinical_dim={clinical_dim}, hidden_dim={hidden_dim}")
+        clinical_dim, hidden_dim = _infer_clinical_dims_from_state(state)
+        print(f"Inferred clinical dims -> clinical_dim={clinical_dim}, hidden_dim={hidden_dim}")
 
-    model = ClinicalMLP(input_dim=clinical_dim, hidden_dim=hidden_dim, dropout=0.4)
-    model.load_state_dict(state, strict=True)
-    model.to(device)
-    model.eval()
+        model = ClinicalMLP(input_dim=clinical_dim, hidden_dim=hidden_dim, dropout=0.4)
+        model.load_state_dict(state, strict=True)
+        model.to(device)
+        model.eval()
 
-    # Vectorize clinical inputs via deterministic hashing to match expected dims
-    clinical_vec = _vectorize_clinical(clinical_json, clinical_dim)
+        # Vectorize clinical inputs via deterministic hashing to match expected dims
+        clinical_vec = _vectorize_clinical(clinical_json, clinical_dim)
 
-    with torch.no_grad():
-        c_tensor = torch.from_numpy(clinical_vec).unsqueeze(0).float().to(device)
-        mlp_risk_score = model(c_tensor).squeeze().item()
+        with torch.no_grad():
+            c_tensor = torch.from_numpy(clinical_vec).unsqueeze(0).float().to(device)
+            mlp_risk_score = model(c_tensor).squeeze().item()
+    else:
+        print(f"Warning: clinical MLP weights not found at {weights_path}; proceeding without base MLP.")
 
     # Try to load and apply CoxStack ensemble (if available)
     # CoxStack bundle must contain: {"aligned_keys": [...], "scaler": StandardScaler, "meta": CoxPHSurvivalAnalysis}
@@ -235,7 +237,9 @@ def interf0_handler():
             meta = bundle.get("meta")
             if isinstance(aligned_keys, list) and scaler is not None and meta is not None and len(aligned_keys) > 0:
                 # Build feature vector in the required key order. We only have MLP at inference.
-                base_pred_map = {"mlp": mlp_risk_score}
+                base_pred_map = {}
+                if mlp_risk_score is not None:
+                    base_pred_map["mlp"] = mlp_risk_score
                 features = [float(base_pred_map.get(k, 0.0)) for k in aligned_keys]
                 X = numpy.asarray(features, dtype=numpy.float32).reshape(1, -1)
                 Xs = scaler.transform(X)
@@ -244,7 +248,7 @@ def interf0_handler():
     except Exception as e:
         print(f"Warning: CoxStack inference failed, falling back to MLP only ({e})")
 
-    final_score = ensemble_score if ensemble_score is not None else mlp_risk_score
+    final_score = ensemble_score if ensemble_score is not None else (mlp_risk_score if mlp_risk_score is not None else 0.0)
 
     # Map final_score to [0, 80] using sigmoid
     prob = 1.0 / (1.0 + math.exp(-final_score))
