@@ -31,6 +31,7 @@ import pyvips
 import numpy
 import torch
 import joblib
+import pandas as pd
 
 
 INPUT_PATH = Path("/input")
@@ -257,6 +258,38 @@ def interf0_handler():
     else:
         print(f"Warning: clinical MLP weights not found at {weights_path}; proceeding without base MLP.")
 
+    # Prepare clinical feature vector using the saved preprocessor (for non-MLP base models)
+    X_processed = None
+    try:
+        preproc_path = RESOURCE_PATH / "clinical_preprocessor.joblib"
+        if preproc_path.exists():
+            preprocessor = joblib.load(preproc_path)
+            # Extract expected columns from fitted ColumnTransformer
+            numeric_cols = []
+            categorical_cols = []
+            try:
+                for name, _trans, cols in preprocessor.transformers_:
+                    if name == 'num':
+                        numeric_cols = list(cols)
+                    elif name == 'cat':
+                        categorical_cols = list(cols)
+            except Exception:
+                pass
+            expected_cols = list(dict.fromkeys(list(numeric_cols) + list(categorical_cols)))
+            # Build one-row DataFrame and ensure all expected columns exist
+            X_df = pd.DataFrame([clinical_json])
+            for col in expected_cols:
+                if col not in X_df.columns:
+                    X_df[col] = pd.NA
+            # Keep only expected columns to match training order
+            if expected_cols:
+                X_df = X_df[expected_cols]
+            X_processed = preprocessor.transform(X_df)
+        else:
+            print(f"Warning: clinical preprocessor not found at {preproc_path}; base model predictions may be unavailable.")
+    except Exception as e:
+        print(f"Warning: failed to preprocess clinical features for base models: {e}")
+
     # Try to load and apply CoxStack ensemble (if available)
     # CoxStack bundle must contain: {"aligned_keys": [...], "scaler": StandardScaler, "meta": CoxPHSurvivalAnalysis}
     ensemble_score = None
@@ -273,6 +306,39 @@ def interf0_handler():
                 base_pred_map = {}
                 if mlp_risk_score is not None:
                     base_pred_map["mlp"] = mlp_risk_score
+                # Compute additional base predictions if resources exist
+                try:
+                    # CoxPH
+                    coxph_bundle_path = RESOURCE_PATH / "coxph_full.joblib"
+                    if "coxph" in aligned_keys and X_processed is not None and coxph_bundle_path.exists():
+                        coxph_obj = joblib.load(coxph_bundle_path)
+                        cox_scaler = coxph_obj.get('scaler')
+                        cox_model = coxph_obj.get('model')
+                        if cox_scaler is not None and cox_model is not None:
+                            xs = cox_scaler.transform(X_processed)
+                            base_pred_map['coxph'] = float(cox_model.predict(xs)[0])
+                except Exception as _e:
+                    print(f"Warning: failed to compute CoxPH base prediction: {_e}")
+                try:
+                    # RSF
+                    rsf_bundle_path = RESOURCE_PATH / "rsf_full.joblib"
+                    if "rsf" in aligned_keys and X_processed is not None and rsf_bundle_path.exists():
+                        rsf_obj = joblib.load(rsf_bundle_path)
+                        rsf_model = rsf_obj.get('model')
+                        if rsf_model is not None:
+                            base_pred_map['rsf'] = float(rsf_model.predict(X_processed)[0])
+                except Exception as _e:
+                    print(f"Warning: failed to compute RSF base prediction: {_e}")
+                try:
+                    # RealMLP (optional)
+                    rmlp_bundle_path = RESOURCE_PATH / "realmlp_full.joblib"
+                    if "realmlp" in aligned_keys and X_processed is not None and rmlp_bundle_path.exists():
+                        rmlp_obj = joblib.load(rmlp_bundle_path)
+                        rmlp_model = rmlp_obj.get('model')
+                        if rmlp_model is not None:
+                            base_pred_map['realmlp'] = float(rmlp_model.predict_risk_score(X_processed)[0])
+                except Exception as _e:
+                    print(f"Warning: failed to compute RealMLP base prediction: {_e}")
                 missing = [k for k in aligned_keys if k not in base_pred_map]
                 if missing:
                     print(f"Warning: missing base predictions for keys {missing}; using 0.0 placeholders.")
