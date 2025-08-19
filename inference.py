@@ -27,11 +27,19 @@ import json
 from glob import glob
 import hashlib
 import math
+import warnings
 import pyvips
 import numpy
 import torch
 import joblib
 import pandas as pd
+
+# Suppress sklearn version mismatch warnings from unpickling
+try:
+    from sklearn.exceptions import InconsistentVersionWarning
+    warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+except Exception:
+    pass
 
 
 INPUT_PATH = Path("/input")
