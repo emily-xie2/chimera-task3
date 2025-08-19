@@ -2,7 +2,7 @@
   "aligned_keys": [
     "rsf",
     "coxph",
-    "realmlp"
+    "mlp"
   ],
-  "val_c_index": 0.9391304347826087
+  "val_c_index": 0.9333333333333333
 }
