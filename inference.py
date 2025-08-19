@@ -236,15 +236,23 @@ def interf0_handler():
             scaler = bundle.get("scaler")
             meta = bundle.get("meta")
             if isinstance(aligned_keys, list) and scaler is not None and meta is not None and len(aligned_keys) > 0:
+                print(f"Loaded CoxStack bundle with keys: {aligned_keys}")
                 # Build feature vector in the required key order. We only have MLP at inference.
                 base_pred_map = {}
                 if mlp_risk_score is not None:
                     base_pred_map["mlp"] = mlp_risk_score
+                missing = [k for k in aligned_keys if k not in base_pred_map]
+                if missing:
+                    print(f"Warning: missing base predictions for keys {missing}; using 0.0 placeholders.")
                 features = [float(base_pred_map.get(k, 0.0)) for k in aligned_keys]
                 X = numpy.asarray(features, dtype=numpy.float32).reshape(1, -1)
                 Xs = scaler.transform(X)
                 # meta.predict expects same shape; returns linear predictor
                 ensemble_score = float(meta.predict(Xs)[0])
+            else:
+                print("CoxStack bundle found but missing required components (aligned_keys/scaler/meta).")
+        else:
+            print(f"CoxStack bundle not found at {coxstack_path}.")
     except Exception as e:
         print(f"Warning: CoxStack inference failed, falling back to MLP only ({e})")
 
