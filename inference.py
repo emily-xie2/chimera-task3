@@ -105,6 +105,29 @@ class ClinicalMLP(torch.nn.Module):
         return self.network(x)
 
 
+def _remap_clinical_state_if_needed(state_dict: dict) -> dict:
+    """Remap exported clinical MLP keys (fc1/fc2/out) to inference model keys (network.*).
+
+    Training export may save keys as fc1/fc2/out. This converts them to the
+    ClinicalMLP's expected sequential keys.
+    """
+    if isinstance(state_dict, dict) and "fc1.weight" in state_dict:
+        key_map = {
+            "fc1.weight": "network.0.weight",
+            "fc1.bias": "network.0.bias",
+            "fc2.weight": "network.3.weight",
+            "fc2.bias": "network.3.bias",
+            "out.weight": "network.6.weight",
+            "out.bias": "network.6.bias",
+        }
+        remapped = {}
+        for src_key, dst_key in key_map.items():
+            if src_key in state_dict:
+                remapped[dst_key] = state_dict[src_key]
+        return remapped
+    return state_dict
+
+
 def _infer_model_dims_from_state(state_dict: dict) -> tuple[int, int, int, int]:
     """Infer (clinical_dim, rna_dim, embed_dim, hidden_dim) from state shapes."""
     # clinical encoder first and second linear layers
@@ -125,8 +148,15 @@ def _infer_model_dims_from_state(state_dict: dict) -> tuple[int, int, int, int]:
 
 def _infer_clinical_dims_from_state(state_dict: dict) -> tuple[int, int]:
     """Infer (clinical_dim, hidden_dim) from clinical-only state shapes."""
-    w0 = state_dict["network.0.weight"]  # [hidden_dim, input_dim]
-    w3 = state_dict.get("network.3.weight")  # [hidden_dim//2, hidden_dim]
+    # Support both naming schemes: network.* and fc*/out.*
+    if "network.0.weight" in state_dict:
+        w0 = state_dict["network.0.weight"]  # [hidden_dim, input_dim]
+        w3 = state_dict.get("network.3.weight")  # [hidden_dim//2, hidden_dim]
+    elif "fc1.weight" in state_dict:
+        w0 = state_dict["fc1.weight"]  # [hidden_dim, input_dim]
+        w3 = state_dict.get("fc2.weight")  # [hidden_dim//2, hidden_dim]
+    else:
+        raise KeyError("Unsupported clinical MLP state dict format: missing 'network.0.weight' or 'fc1.weight'")
     hidden_dim = w0.shape[0]
     clinical_dim = w0.shape[1]
     if w3 is not None:
@@ -207,6 +237,8 @@ def interf0_handler():
         state = torch.load(weights_path, map_location="cpu")
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
+        # Remap state keys if exported as fc1/fc2/out
+        state = _remap_clinical_state_if_needed(state)
 
         clinical_dim, hidden_dim = _infer_clinical_dims_from_state(state)
         print(f"Inferred clinical dims -> clinical_dim={clinical_dim}, hidden_dim={hidden_dim}")
