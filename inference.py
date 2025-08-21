@@ -298,9 +298,90 @@ def interf0_handler():
     except Exception as e:
         print(f"Warning: failed to preprocess clinical features for base models: {e}")
 
-    # Try to load and apply CoxStack ensemble (if available)
-    # CoxStack bundle must contain: {"aligned_keys": [...], "scaler": StandardScaler, "meta": CoxPHSurvivalAnalysis}
+    # Try to load and apply ensembles in order of preference
+    # 1) TopKMean: lightweight JSON bundle with aligned_keys and per-key (mean,std) for z-scoring
+    # 2) CoxStack: joblib bundle with scaler+meta CoxPH
     ensemble_score = None
+    try:
+        topk_path = RESOURCE_PATH / "topkmean.json"
+        if topk_path.exists():
+            with open(topk_path, "r") as f:
+                topk = json.load(f)
+            aligned_keys = topk.get("aligned_keys", [])
+            stats = topk.get("stats", {})  # key -> [mean, std]
+            if isinstance(aligned_keys, list) and len(aligned_keys) >= 2:
+                print(f"Loaded TopKMean bundle with keys: {aligned_keys}")
+                # Build base prediction map (MLP, CoxPH, RSF, RealMLP) similar to CoxStack
+                base_pred_map = {}
+                if mlp_risk_score is not None:
+                    base_pred_map["mlp"] = mlp_risk_score
+                # Try additional base models using saved resources
+                try:
+                    coxph_bundle_path = RESOURCE_PATH / "coxph_full.joblib"
+                    if "coxph" in aligned_keys and X_processed is not None and coxph_bundle_path.exists():
+                        coxph_obj = joblib.load(coxph_bundle_path)
+                        cox_scaler = coxph_obj.get('scaler')
+                        cox_model = coxph_obj.get('model')
+                        if cox_scaler is not None and cox_model is not None:
+                            xs = cox_scaler.transform(X_processed)
+                            base_pred_map['coxph'] = float(cox_model.predict(xs)[0])
+                except Exception as _e:
+                    print(f"Warning: failed to compute CoxPH base prediction: {_e}")
+                try:
+                    rsf_bundle_path = RESOURCE_PATH / "rsf_full.joblib"
+                    if "rsf" in aligned_keys and X_processed is not None and rsf_bundle_path.exists():
+                        rsf_obj = joblib.load(rsf_bundle_path)
+                        rsf_model = rsf_obj.get('model')
+                        if rsf_model is not None:
+                            base_pred_map['rsf'] = float(rsf_model.predict(X_processed)[0])
+                except Exception as _e:
+                    print(f"Warning: failed to compute RSF base prediction: {_e}")
+                try:
+                    rmlp_bundle_path = RESOURCE_PATH / "realmlp_full.joblib"
+                    if "realmlp" in aligned_keys and X_processed is not None and rmlp_bundle_path.exists():
+                        rmlp_obj = joblib.load(rmlp_bundle_path)
+                        rmlp_model = rmlp_obj.get('model')
+                        if rmlp_model is not None:
+                            base_pred_map['realmlp'] = float(rmlp_model.predict_risk_score(X_processed)[0])
+                except Exception as _e:
+                    print(f"Warning: failed to compute RealMLP base prediction: {_e}")
+
+                # XGBSE optional
+                try:
+                    xgbse_path = RESOURCE_PATH / "xgbse_full.joblib"
+                    if "xgbse" in aligned_keys and X_processed is not None and xgbse_path.exists():
+                        xgb_obj = joblib.load(xgbse_path)
+                        xgb_model = xgb_obj.get('model') if isinstance(xgb_obj, dict) else xgb_obj
+                        if xgb_model is not None:
+                            pred = xgb_model.predict(X_processed)
+                            risk = 1.0 - float(pred.mean(axis=1)[0]) if getattr(pred, 'ndim', 1) > 1 else (1.0 - float(pred[0]))
+                            base_pred_map['xgbse'] = risk
+                except Exception as _e:
+                    print(f"Warning: failed to compute XGBSE base prediction: {_e}")
+
+                # Assemble z-scored features for keys we have
+                feats = []
+                used = []
+                for k in aligned_keys:
+                    if k in base_pred_map and k in stats:
+                        mu, sd = stats.get(k, [0.0, 1.0])
+                        sd = sd if (isinstance(sd, (int, float)) and sd > 1e-8) else 1.0
+                        z = (float(base_pred_map[k]) - float(mu)) / float(sd)
+                        feats.append(z)
+                        used.append(k)
+                if len(feats) >= 2:
+                    ensemble_score = float(sum(feats) / len(feats))
+                    print(f"TopKMean used keys: {used}")
+                else:
+                    print("TopKMean bundle present but insufficient base predictions; falling back.")
+            else:
+                print("TopKMean bundle found but missing/insufficient aligned_keys.")
+        else:
+            print(f"TopKMean bundle not found at {topk_path}.")
+    except Exception as e:
+        print(f"Warning: TopKMean inference failed ({e}); trying CoxStack next")
+
+    # CoxStack bundle must contain: {"aligned_keys": [...], "scaler": StandardScaler, "meta": CoxPHSurvivalAnalysis}
     try:
         coxstack_path = RESOURCE_PATH / "coxstack.joblib"
         if coxstack_path.exists():
