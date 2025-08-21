@@ -24,16 +24,11 @@ Happy programming!
 from pathlib import Path
 import os
 import json
-from glob import glob
-import numpy as np
 import hashlib
 import math
 import warnings
-import pyvips
 import numpy
 import torch
-import joblib
-import pandas as pd
 
 # Suppress sklearn version mismatch warnings from unpickling
 try:
@@ -240,269 +235,52 @@ def interf0_handler():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Optionally load clinical-only MLP if present
-    mlp_risk_score = None
+    # Load clinical-only MLP (required)
     weights_path = RESOURCE_PATH / "clinical_mlp.pt"
-    if weights_path.exists():
-        state = torch.load(weights_path, map_location="cpu")
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
-        # Remap state keys if exported as fc1/fc2/out
-        state = _remap_clinical_state_if_needed(state)
+    if not weights_path.exists():
+        raise RuntimeError(f"Required clinical MLP weights not found at {weights_path}")
 
-        clinical_dim, hidden_dim = _infer_clinical_dims_from_state(state)
-        print(f"Inferred clinical dims -> clinical_dim={clinical_dim}, hidden_dim={hidden_dim}")
+    state = torch.load(weights_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    # Remap state keys if exported as fc1/fc2/out
+    state = _remap_clinical_state_if_needed(state)
 
-        model = ClinicalMLP(input_dim=clinical_dim, hidden_dim=hidden_dim, dropout=0.4)
-        model.load_state_dict(state, strict=True)
-        model.to(device)
-        model.eval()
+    clinical_dim, hidden_dim = _infer_clinical_dims_from_state(state)
+    print(f"Inferred clinical dims -> clinical_dim={clinical_dim}, hidden_dim={hidden_dim}")
 
-        # Vectorize clinical inputs via deterministic hashing to match expected dims
-        clinical_vec = _vectorize_clinical(clinical_json, clinical_dim)
+    model = ClinicalMLP(input_dim=clinical_dim, hidden_dim=hidden_dim, dropout=0.4)
+    model.load_state_dict(state, strict=True)
+    model.to(device)
+    model.eval()
 
-        with torch.no_grad():
-            c_tensor = torch.from_numpy(clinical_vec).unsqueeze(0).float().to(device)
-            mlp_risk_score = model(c_tensor).squeeze().item()
-    else:
-        print(f"Warning: clinical MLP weights not found at {weights_path}; proceeding without base MLP.")
+    # Vectorize clinical inputs via deterministic hashing to match expected dims
+    clinical_vec = _vectorize_clinical(clinical_json, clinical_dim)
 
-    # Prepare clinical feature vector using the saved preprocessor (for non-MLP base models)
-    X_processed = None
-    try:
-        preproc_path = RESOURCE_PATH / "clinical_preprocessor.joblib"
-        if preproc_path.exists():
-            preprocessor = joblib.load(preproc_path)
-            # Extract expected columns from fitted ColumnTransformer
-            numeric_cols, categorical_cols = [], []
-            try:
-                for name, _trans, cols in preprocessor.transformers_:
-                    if name == 'num':
-                        numeric_cols = list(cols)
-                    elif name == 'cat':
-                        categorical_cols = list(cols)
-            except Exception:
-                pass
-            expected_cols = list(dict.fromkeys(list(numeric_cols) + list(categorical_cols)))
-            X_df = pd.DataFrame([clinical_json])
-            for col in expected_cols:
-                if col not in X_df.columns:
-                    X_df[col] = pd.NA
-            if expected_cols:
-                X_df = X_df[expected_cols]
-            X_processed = preprocessor.transform(X_df)
-        else:
-            print(f"Warning: clinical preprocessor not found at {preproc_path}; attempting JSON spec fallback.")
-    except Exception as e:
-        print(f"Warning: failed to preprocess clinical features via joblib: {e}; attempting JSON spec fallback.")
+    with torch.no_grad():
+        c_tensor = torch.from_numpy(clinical_vec).unsqueeze(0).float().to(device)
+        mlp_risk_score = model(c_tensor).squeeze().item()
 
-    # Fallback: use portable JSON spec if available
-    if X_processed is None:
-        try:
-            spec_path = RESOURCE_PATH / "clinical_preproc_spec.json"
-            if spec_path.exists():
-                with open(spec_path, 'r') as f:
-                    spec = json.load(f)
-                num_cols = spec.get('numeric_cols', [])
-                cat_cols = spec.get('categorical_cols', [])
-                num_stats = spec.get('numeric', {})
-                cat_stats = spec.get('categorical', {})
-                imputer_stats = num_stats.get('imputer_statistics', {})
-                scaler_mean = num_stats.get('scaler_mean', {})
-                scaler_scale = num_stats.get('scaler_scale', {})
-                cat_fill = cat_stats.get('imputer_fill', {})
-                # Build single-row dataframe
-                X_df = pd.DataFrame([clinical_json])
-                # Ensure numeric columns exist and impute missing
-                for c in num_cols:
-                    if c not in X_df.columns:
-                        X_df[c] = pd.NA
-                    val = X_df.at[0, c]
-                    if pd.isna(val):
-                        rep = imputer_stats.get(c, None)
-                        X_df.at[0, c] = rep if rep is not None else 0.0
-                # Ensure categorical columns exist and impute missing
-                for c in cat_cols:
-                    if c not in X_df.columns:
-                        X_df[c] = pd.NA
-                    val = X_df.at[0, c]
-                    if pd.isna(val):
-                        rep = cat_fill.get(c, None)
-                        X_df.at[0, c] = rep
-                # Standardize numeric columns
-                num_array = []
-                for c in num_cols:
-                    x = float(X_df.at[0, c]) if X_df.at[0, c] is not None and pd.notna(X_df.at[0, c]) else 0.0
-                    m = float(scaler_mean.get(c, 0.0))
-                    s = float(scaler_scale.get(c, 1.0)) or 1.0
-                    num_array.append((x - m) / (s if s != 0 else 1.0))
-                num_array = np.asarray(num_array, dtype=np.float32)
-                # One-hot categorical according to training categories
-                oh_list = []
-                oh_cats = cat_stats.get('onehot_categories', {})
-                for c in cat_cols:
-                    cats = oh_cats.get(c, [])
-                    v = X_df.at[0, c]
-                    row = [(1.0 if (str(v) == str(cat)) else 0.0) for cat in cats]
-                    oh_list.append(row)
-                if oh_list:
-                    oh_array = np.concatenate([np.asarray(r, dtype=np.float32) for r in oh_list], axis=0)
-                else:
-                    oh_array = np.zeros((0,), dtype=np.float32)
-                X_processed = np.concatenate([num_array, oh_array], axis=0).reshape(1, -1)
-                print("Applied portable preprocessor spec successfully.")
-            else:
-                print(f"Portable preprocessor spec not found at {spec_path}.")
-        except Exception as e:
-            print(f"Warning: portable preprocessor spec application failed: {e}")
-
-    # Try to load and apply ensembles in order of preference
-    # 1) TopKMean: lightweight JSON bundle with aligned_keys and per-key (mean,std) for z-scoring
-    # 2) CoxStack: joblib bundle with scaler+meta CoxPH
-    ensemble_score = None
-    try:
-        topk_path = RESOURCE_PATH / "topkmean.json"
-        if topk_path.exists():
-            with open(topk_path, "r") as f:
-                topk = json.load(f)
-            aligned_keys = topk.get("aligned_keys", [])
-            stats = topk.get("stats", {})  # key -> [mean, std]
-            if isinstance(aligned_keys, list) and len(aligned_keys) >= 2:
-                print(f"Loaded TopKMean bundle with keys: {aligned_keys}")
-                # Build base prediction map (MLP, CoxPH, RSF, RealMLP) similar to CoxStack
-                base_pred_map = {}
-                if mlp_risk_score is not None:
-                    base_pred_map["mlp"] = mlp_risk_score
-                # Try additional base models using saved resources
-                try:
-                    coxph_bundle_path = RESOURCE_PATH / "coxph_full.joblib"
-                    if "coxph" in aligned_keys and X_processed is not None and coxph_bundle_path.exists():
-                        coxph_obj = joblib.load(coxph_bundle_path)
-                        cox_scaler = coxph_obj.get('scaler')
-                        cox_model = coxph_obj.get('model')
-                        if cox_scaler is not None and cox_model is not None:
-                            xs = cox_scaler.transform(X_processed)
-                            base_pred_map['coxph'] = float(cox_model.predict(xs)[0])
-                except Exception as _e:
-                    print(f"Warning: failed to compute CoxPH base prediction: {_e}")
-                try:
-                    rsf_bundle_path = RESOURCE_PATH / "rsf_full.joblib"
-                    if "rsf" in aligned_keys and X_processed is not None and rsf_bundle_path.exists():
-                        rsf_obj = joblib.load(rsf_bundle_path)
-                        rsf_model = rsf_obj.get('model')
-                        if rsf_model is not None:
-                            base_pred_map['rsf'] = float(rsf_model.predict(X_processed)[0])
-                except Exception as _e:
-                    print(f"Warning: failed to compute RSF base prediction: {_e}")
-                try:
-                    rmlp_bundle_path = RESOURCE_PATH / "realmlp_full.joblib"
-                    if "realmlp" in aligned_keys and X_processed is not None and rmlp_bundle_path.exists():
-                        rmlp_obj = joblib.load(rmlp_bundle_path)
-                        rmlp_model = rmlp_obj.get('model')
-                        if rmlp_model is not None:
-                            base_pred_map['realmlp'] = float(rmlp_model.predict_risk_score(X_processed)[0])
-                except Exception as _e:
-                    print(f"Warning: failed to compute RealMLP base prediction: {_e}")
-
-                # XGBSE optional
-                try:
-                    xgbse_path = RESOURCE_PATH / "xgbse_full.joblib"
-                    if "xgbse" in aligned_keys and X_processed is not None and xgbse_path.exists():
-                        xgb_obj = joblib.load(xgbse_path)
-                        xgb_model = xgb_obj.get('model') if isinstance(xgb_obj, dict) else xgb_obj
-                        if xgb_model is not None:
-                            pred = xgb_model.predict(X_processed)
-                            risk = 1.0 - float(pred.mean(axis=1)[0]) if getattr(pred, 'ndim', 1) > 1 else (1.0 - float(pred[0]))
-                            base_pred_map['xgbse'] = risk
-                except Exception as _e:
-                    print(f"Warning: failed to compute XGBSE base prediction: {_e}")
-
-                # Assemble z-scored features for keys we have
-                feats = []
-                used = []
-                for k in aligned_keys:
-                    if k in base_pred_map and k in stats:
-                        mu, sd = stats.get(k, [0.0, 1.0])
-                        sd = sd if (isinstance(sd, (int, float)) and sd > 1e-8) else 1.0
-                        z = (float(base_pred_map[k]) - float(mu)) / float(sd)
-                        feats.append(z)
-                        used.append(k)
-                # Proceed if we have at least one z-scored base prediction; this enables MLP-only fallback
-                if len(feats) >= 1:
-                    ensemble_score = float(sum(feats) / len(feats))
-                    print(f"TopKMean used keys: {used}")
-                else:
-                    print("TopKMean bundle present but no usable base predictions; falling back.")
-            else:
-                print("TopKMean bundle found but missing/insufficient aligned_keys.")
-        else:
-            print(f"TopKMean bundle not found at {topk_path}.")
-    except Exception as e:
-        print(f"Warning: TopKMean inference failed ({e}); trying CoxStack next")
-
-    # CoxStack bundle must contain: {"aligned_keys": [...], "scaler": StandardScaler, "meta": CoxPHSurvivalAnalysis}
-    try:
-        coxstack_path = RESOURCE_PATH / "coxstack.joblib"
-        if coxstack_path.exists():
-            bundle = joblib.load(coxstack_path)
-            aligned_keys = bundle.get("aligned_keys", [])
-            scaler = bundle.get("scaler")
-            meta = bundle.get("meta")
-            if isinstance(aligned_keys, list) and scaler is not None and meta is not None and len(aligned_keys) > 0:
-                print(f"Loaded CoxStack bundle with keys: {aligned_keys}")
-                # Build feature vector in the required key order. We only have MLP at inference.
-                base_pred_map = {}
-                if mlp_risk_score is not None:
-                    base_pred_map["mlp"] = mlp_risk_score
-                # Compute additional base predictions if resources exist
-                try:
-                    # CoxPH
-                    coxph_bundle_path = RESOURCE_PATH / "coxph_full.joblib"
-                    if "coxph" in aligned_keys and X_processed is not None and coxph_bundle_path.exists():
-                        coxph_obj = joblib.load(coxph_bundle_path)
-                        cox_scaler = coxph_obj.get('scaler')
-                        cox_model = coxph_obj.get('model')
-                        if cox_scaler is not None and cox_model is not None:
-                            xs = cox_scaler.transform(X_processed)
-                            base_pred_map['coxph'] = float(cox_model.predict(xs)[0])
-                except Exception as _e:
-                    print(f"Warning: failed to compute CoxPH base prediction: {_e}")
-                try:
-                    # RSF
-                    rsf_bundle_path = RESOURCE_PATH / "rsf_full.joblib"
-                    if "rsf" in aligned_keys and X_processed is not None and rsf_bundle_path.exists():
-                        rsf_obj = joblib.load(rsf_bundle_path)
-                        rsf_model = rsf_obj.get('model')
-                        if rsf_model is not None:
-                            base_pred_map['rsf'] = float(rsf_model.predict(X_processed)[0])
-                except Exception as _e:
-                    print(f"Warning: failed to compute RSF base prediction: {_e}")
-                try:
-                    # RealMLP (optional)
-                    rmlp_bundle_path = RESOURCE_PATH / "realmlp_full.joblib"
-                    if "realmlp" in aligned_keys and X_processed is not None and rmlp_bundle_path.exists():
-                        rmlp_obj = joblib.load(rmlp_bundle_path)
-                        rmlp_model = rmlp_obj.get('model')
-                        if rmlp_model is not None:
-                            base_pred_map['realmlp'] = float(rmlp_model.predict_risk_score(X_processed)[0])
-                except Exception as _e:
-                    print(f"Warning: failed to compute RealMLP base prediction: {_e}")
-                missing = [k for k in aligned_keys if k not in base_pred_map]
-                if missing:
-                    print(f"Warning: missing base predictions for keys {missing}; using 0.0 placeholders.")
-                features = [float(base_pred_map.get(k, 0.0)) for k in aligned_keys]
-                X = numpy.asarray(features, dtype=numpy.float32).reshape(1, -1)
-                Xs = scaler.transform(X)
-                # meta.predict expects same shape; returns linear predictor
-                ensemble_score = float(meta.predict(Xs)[0])
-            else:
-                print("CoxStack bundle found but missing required components (aligned_keys/scaler/meta).")
-        else:
-            print(f"CoxStack bundle not found at {coxstack_path}.")
-    except Exception as e:
-        print(f"Warning: CoxStack inference failed, falling back to MLP only ({e})")
-
-    final_score = ensemble_score if ensemble_score is not None else (mlp_risk_score if mlp_risk_score is not None else 0.0)
+    # TopKMean ensemble (required). Only the 'mlp' base prediction is allowed.
+    topk_path = RESOURCE_PATH / "topkmean.json"
+    if not topk_path.exists():
+        raise RuntimeError(f"Required TopKMean bundle not found at {topk_path}")
+    with open(topk_path, "r") as f:
+        topk = json.load(f)
+    aligned_keys = topk.get("aligned_keys", [])
+    stats = topk.get("stats", {})
+    if not isinstance(aligned_keys, list) or not aligned_keys:
+        raise RuntimeError("TopKMean bundle missing 'aligned_keys'")
+    if "mlp" not in aligned_keys:
+        raise RuntimeError("TopKMean bundle does not include required key 'mlp'")
+    if "mlp" not in stats or not isinstance(stats.get("mlp"), (list, tuple)) or len(stats.get("mlp")) != 2:
+        raise RuntimeError("TopKMean stats for 'mlp' are missing or malformed")
+    mu, sd = stats["mlp"]
+    sd = float(sd) if (isinstance(sd, (int, float)) and float(sd) > 1e-8) else None
+    if sd is None:
+        raise RuntimeError("TopKMean std for 'mlp' must be positive")
+    final_score = (float(mlp_risk_score) - float(mu)) / sd
+    print("TopKMean used keys: ['mlp']")
 
     # Map final_score to [0, 80] using sigmoid
     prob = 1.0 / (1.0 + math.exp(-final_score))
@@ -532,36 +310,7 @@ def write_json_file(*, location, content):
 
 
 def load_image_file_as_thumbnail(*, location, max_size=1024):
-    input_files = (
-        glob(str(location / "*.tif"))
-        + glob(str(location / "*.tiff"))
-        + glob(str(location / "*.mha"))
-        + glob(str(location / "*.mrxs"))
-        + glob(str(location / "*.svs"))
-        + glob(str(location / "*.ndpi"))
-    )
-    if not input_files:
-        raise FileNotFoundError(f"No compatible image files found in {location}")
-    file_path = input_files[0]
-    print(f"Loading pathology image as thumbnail using PyVips (fast path): {file_path}")
-    try:
-        # Fast path: decode at thumbnail size using pyramid levels when available
-        thumb = pyvips.Image.thumbnail(file_path, max_size, height=max_size)
-        return thumb
-    except Exception as e:
-        print(f"PyVips thumbnail fast path failed ({e}), falling back to sequential read")
-        image = pyvips.Image.new_from_file(file_path, access="sequential")
-        scale_factor = min(max_size / image.width, max_size / image.height)
-        if scale_factor < 1.0:
-            print(
-                f"Downsampling image by factor {scale_factor:.3f} (from {image.width}x{image.height} to {int(image.width*scale_factor)}x{int(image.height*scale_factor)})"
-            )
-            image = image.resize(scale_factor)
-        else:
-            print(
-                f"Image size {image.width}x{image.height} is within max_size={max_size}, no downsampling needed"
-            )
-        return image
+    raise NotImplementedError("Image loading is not used in this inference pipeline")
 
 
 def _env_flag(name: str, default: bool) -> bool:
