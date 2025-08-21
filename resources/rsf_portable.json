@@ -1,0 +1,3 @@
+{
+  "note": "portable RSF not supported; using joblib at inference if available"
+}

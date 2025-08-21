@@ -213,6 +213,55 @@ def _vectorize_rna(rna_json: dict, dim: int) -> numpy.ndarray:
     return vec
 
 
+def _apply_portable_preprocessor(clinical_json: dict, spec: dict) -> numpy.ndarray:
+    """Apply portable preprocessor spec to a single clinical JSON row.
+
+    Returns a 1D numpy array matching the training feature order:
+    [standardized numeric..., onehot categorical...]
+    """
+    num_cols = spec.get('numeric_cols', [])
+    cat_cols = spec.get('categorical_cols', [])
+    num_stats = spec.get('numeric', {})
+    cat_stats = spec.get('categorical', {})
+    imputer_stats = (num_stats or {}).get('imputer_statistics', {})
+    scaler_mean = (num_stats or {}).get('scaler_mean', {})
+    scaler_scale = (num_stats or {}).get('scaler_scale', {})
+    onehot_cats = (cat_stats or {}).get('onehot_categories', {})
+
+    # Numeric block
+    num_array = []
+    for c in num_cols:
+        raw = clinical_json.get(c, None)
+        if raw is None or (isinstance(raw, float) and not math.isfinite(raw)):
+            raw = imputer_stats.get(c, 0.0)
+        try:
+            x = float(raw)
+        except Exception:
+            x = 0.0
+        m = float(scaler_mean.get(c, 0.0))
+        s = float(scaler_scale.get(c, 1.0))
+        if s == 0.0 or not math.isfinite(s):
+            s = 1.0
+        num_array.append((x - m) / s)
+    num_array = numpy.asarray(num_array, dtype=numpy.float32)
+
+    # Categorical one-hot block
+    oh_vectors = []
+    for c in cat_cols:
+        cats = onehot_cats.get(c, [])
+        v = clinical_json.get(c, None)
+        v_str = None if v is None else str(v)
+        row = [1.0 if (v_str == (None if cat is None else str(cat))) else 0.0 for cat in cats]
+        oh_vectors.append(numpy.asarray(row, dtype=numpy.float32))
+    if oh_vectors:
+        oh_array = numpy.concatenate(oh_vectors, axis=0)
+    else:
+        oh_array = numpy.zeros((0,), dtype=numpy.float32)
+
+    feats = numpy.concatenate([num_array, oh_array], axis=0)
+    return feats
+
+
 def run():
     interface_key = get_interface_key()
     handler = {
@@ -261,7 +310,7 @@ def interf0_handler():
         c_tensor = torch.from_numpy(clinical_vec).unsqueeze(0).float().to(device)
         mlp_risk_score = model(c_tensor).squeeze().item()
 
-    # TopKMean ensemble (required). Only the 'mlp' base prediction is allowed.
+    # TopKMean ensemble (required). Only portable base predictions are allowed.
     topk_path = RESOURCE_PATH / "topkmean.json"
     if not topk_path.exists():
         raise RuntimeError(f"Required TopKMean bundle not found at {topk_path}")
@@ -271,16 +320,63 @@ def interf0_handler():
     stats = topk.get("stats", {})
     if not isinstance(aligned_keys, list) or not aligned_keys:
         raise RuntimeError("TopKMean bundle missing 'aligned_keys'")
-    if "mlp" not in aligned_keys:
-        raise RuntimeError("TopKMean bundle does not include required key 'mlp'")
-    if "mlp" not in stats or not isinstance(stats.get("mlp"), (list, tuple)) or len(stats.get("mlp")) != 2:
-        raise RuntimeError("TopKMean stats for 'mlp' are missing or malformed")
-    mu, sd = stats["mlp"]
-    sd = float(sd) if (isinstance(sd, (int, float)) and float(sd) > 1e-8) else None
-    if sd is None:
-        raise RuntimeError("TopKMean std for 'mlp' must be positive")
-    final_score = (float(mlp_risk_score) - float(mu)) / sd
-    print("TopKMean used keys: ['mlp']")
+
+    # Build portable base predictions
+    base_pred_map: dict[str, float] = {}
+    base_pred_map['mlp'] = float(mlp_risk_score)
+
+    # Compute CoxPH base prediction using portable JSON and portable preprocessor spec
+    spec_path = RESOURCE_PATH / "clinical_preproc_spec.json"
+    cox_portable_path = RESOURCE_PATH / "coxph_portable.json"
+    if not spec_path.exists():
+        raise RuntimeError(f"Required portable preprocessor spec not found at {spec_path}")
+    if not cox_portable_path.exists():
+        raise RuntimeError(f"Required portable CoxPH weights not found at {cox_portable_path}")
+    with open(spec_path, 'r') as f:
+        spec = json.load(f)
+    with open(cox_portable_path, 'r') as f:
+        cox = json.load(f)
+    x_pre = _apply_portable_preprocessor(clinical_json, spec)
+    c_mean = numpy.asarray(cox.get('scaler_mean', []), dtype=numpy.float32)
+    c_scale = numpy.asarray(cox.get('scaler_scale', []), dtype=numpy.float32)
+    beta = numpy.asarray(cox.get('coef', []), dtype=numpy.float32)
+    if x_pre.shape[0] != c_mean.shape[0] or x_pre.shape[0] != c_scale.shape[0] or x_pre.shape[0] != beta.shape[0]:
+        raise RuntimeError(
+            f"CoxPH portable shapes mismatch: x={x_pre.shape[0]}, mean={c_mean.shape[0]}, scale={c_scale.shape[0]}, coef={beta.shape[0]}"
+        )
+    # Apply CoxPH scaler and compute linear predictor
+    x_scaled = (x_pre - c_mean) / numpy.where(c_scale == 0.0, 1.0, c_scale)
+    coxph_score = float(numpy.dot(x_scaled, beta))
+    base_pred_map['coxph'] = coxph_score
+
+    # Optional: RSF base prediction via joblib bundle if present (still weight-only ensemble)
+    try:
+        rsf_bundle_path = RESOURCE_PATH / "rsf_full.joblib"
+        if rsf_bundle_path.exists() and 'rsf' in aligned_keys:
+            import joblib  # local import to avoid global dependency unless needed
+            rsf_obj = joblib.load(rsf_bundle_path)
+            rsf_model = rsf_obj.get('model') if isinstance(rsf_obj, dict) else rsf_obj
+            # Reuse the same portable features used for CoxPH
+            rsf_score = float(numpy.atleast_1d(rsf_model.predict(x_pre.reshape(1, -1)))[0])
+            base_pred_map['rsf'] = rsf_score
+    except Exception as _e:
+        print(f"Warning: failed to compute RSF base prediction: {_e}")
+
+    # Only allow supported keys and require at least 2
+    supported = ['mlp', 'coxph', 'rsf']
+    used_keys = [k for k in aligned_keys if k in supported]
+    if len(used_keys) < 2:
+        raise RuntimeError("TopKMean must include at least two supported keys: 'mlp' and 'coxph'")
+    # Assemble z-scored features for used keys
+    feats = []
+    for k in used_keys:
+        if k not in stats or not isinstance(stats.get(k), (list, tuple)) or len(stats.get(k)) != 2:
+            raise RuntimeError(f"TopKMean stats for '{k}' are missing or malformed")
+        mu, sd = stats[k]
+        sd = float(sd) if (isinstance(sd, (int, float)) and float(sd) > 1e-8) else 1.0
+        feats.append((float(base_pred_map[k]) - float(mu)) / sd)
+    final_score = float(sum(feats) / len(feats))
+    print(f"TopKMean used keys: {used_keys}")
 
     # Map final_score to [0, 80] using sigmoid
     prob = 1.0 / (1.0 + math.exp(-final_score))

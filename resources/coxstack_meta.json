@@ -2,7 +2,7 @@
   "aligned_keys": [
     "rsf",
     "xgbse",
-    "mlp"
+    "coxph"
   ],
   "val_c_index": 0.896551724137931
 }
