@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "numeric_cols": [
+    "age",
+    "no_instillations"
+  ],
+  "categorical_cols": [
+    "sex",
+    "smoking",
+    "tumor",
+    "stage",
+    "substage",
+    "grade",
+    "reTUR",
+    "LVI",
+    "variant",
+    "EORTC",
+    "BRS"
+  ],
+  "numeric": {
+    "imputer_statistics": {
+      "age": 69.1534090909091,
+      "no_instillations": 18.810344827586206
+    },
+    "scaler_mean": {
+      "age": 69.1534090909091,
+      "no_instillations": 18.810344827586206
+    },
+    "scaler_scale": {
+      "age": 9.126901406676314,
+      "no_instillations": 9.080680472133714
+    }
+  },
+  "categorical": {
+    "imputer_fill": {
+      "sex": "Male",
+      "smoking": "Yes",
+      "tumor": "Primary",
+      "stage": "T1HG",
+      "substage": "T1e",
+      "grade": "G3",
+      "reTUR": "Yes",
+      "LVI": "No",
+      "variant": "UCC",
+      "EORTC": "Highest risk",
+      "BRS": "BRS2"
+    },
+    "onehot_categories": {
+      "sex": [
+        "Female",
+        "Male"
+      ],
+      "smoking": [
+        "-1",
+        "No",
+        "Yes"
+      ],
+      "tumor": [
+        "Primary"
+      ],
+      "stage": [
+        "T1HG",
+        "TaHG"
+      ],
+      "substage": [
+        "-1",
+        "T1e",
+        "T1m"
+      ],
+      "grade": [
+        "G2",
+        "G3"
+      ],
+      "reTUR": [
+        "No",
+        "Yes"
+      ],
+      "LVI": [
+        "-1",
+        "No",
+        "Yes"
+      ],
+      "variant": [
+        "UCC",
+        "UCC + Variant"
+      ],
+      "EORTC": [
+        "High risk",
+        "Highest risk"
+      ],
+      "BRS": [
+        "BRS1",
+        "BRS2",
+        "BRS3"
+      ]
+    }
+  }
+}

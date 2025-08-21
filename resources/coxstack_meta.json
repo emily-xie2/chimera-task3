@@ -1,8 +1,8 @@
 {
   "aligned_keys": [
     "rsf",
-    "mlp",
-    "xgbse"
+    "xgbse",
+    "mlp"
   ],
   "val_c_index": 0.896551724137931
 }

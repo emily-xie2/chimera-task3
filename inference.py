@@ -25,6 +25,7 @@ from pathlib import Path
 import os
 import json
 from glob import glob
+import numpy as np
 import hashlib
 import math
 import warnings
@@ -273,8 +274,7 @@ def interf0_handler():
         if preproc_path.exists():
             preprocessor = joblib.load(preproc_path)
             # Extract expected columns from fitted ColumnTransformer
-            numeric_cols = []
-            categorical_cols = []
+            numeric_cols, categorical_cols = [], []
             try:
                 for name, _trans, cols in preprocessor.transformers_:
                     if name == 'num':
@@ -284,19 +284,77 @@ def interf0_handler():
             except Exception:
                 pass
             expected_cols = list(dict.fromkeys(list(numeric_cols) + list(categorical_cols)))
-            # Build one-row DataFrame and ensure all expected columns exist
             X_df = pd.DataFrame([clinical_json])
             for col in expected_cols:
                 if col not in X_df.columns:
                     X_df[col] = pd.NA
-            # Keep only expected columns to match training order
             if expected_cols:
                 X_df = X_df[expected_cols]
             X_processed = preprocessor.transform(X_df)
         else:
-            print(f"Warning: clinical preprocessor not found at {preproc_path}; base model predictions may be unavailable.")
+            print(f"Warning: clinical preprocessor not found at {preproc_path}; attempting JSON spec fallback.")
     except Exception as e:
-        print(f"Warning: failed to preprocess clinical features for base models: {e}")
+        print(f"Warning: failed to preprocess clinical features via joblib: {e}; attempting JSON spec fallback.")
+
+    # Fallback: use portable JSON spec if available
+    if X_processed is None:
+        try:
+            spec_path = RESOURCE_PATH / "clinical_preproc_spec.json"
+            if spec_path.exists():
+                with open(spec_path, 'r') as f:
+                    spec = json.load(f)
+                num_cols = spec.get('numeric_cols', [])
+                cat_cols = spec.get('categorical_cols', [])
+                num_stats = spec.get('numeric', {})
+                cat_stats = spec.get('categorical', {})
+                imputer_stats = num_stats.get('imputer_statistics', {})
+                scaler_mean = num_stats.get('scaler_mean', {})
+                scaler_scale = num_stats.get('scaler_scale', {})
+                cat_fill = cat_stats.get('imputer_fill', {})
+                # Build single-row dataframe
+                X_df = pd.DataFrame([clinical_json])
+                # Ensure numeric columns exist and impute missing
+                for c in num_cols:
+                    if c not in X_df.columns:
+                        X_df[c] = pd.NA
+                    val = X_df.at[0, c]
+                    if pd.isna(val):
+                        rep = imputer_stats.get(c, None)
+                        X_df.at[0, c] = rep if rep is not None else 0.0
+                # Ensure categorical columns exist and impute missing
+                for c in cat_cols:
+                    if c not in X_df.columns:
+                        X_df[c] = pd.NA
+                    val = X_df.at[0, c]
+                    if pd.isna(val):
+                        rep = cat_fill.get(c, None)
+                        X_df.at[0, c] = rep
+                # Standardize numeric columns
+                num_array = []
+                for c in num_cols:
+                    x = float(X_df.at[0, c]) if X_df.at[0, c] is not None and pd.notna(X_df.at[0, c]) else 0.0
+                    m = float(scaler_mean.get(c, 0.0))
+                    s = float(scaler_scale.get(c, 1.0)) or 1.0
+                    num_array.append((x - m) / (s if s != 0 else 1.0))
+                num_array = np.asarray(num_array, dtype=np.float32)
+                # One-hot categorical according to training categories
+                oh_list = []
+                oh_cats = cat_stats.get('onehot_categories', {})
+                for c in cat_cols:
+                    cats = oh_cats.get(c, [])
+                    v = X_df.at[0, c]
+                    row = [(1.0 if (str(v) == str(cat)) else 0.0) for cat in cats]
+                    oh_list.append(row)
+                if oh_list:
+                    oh_array = np.concatenate([np.asarray(r, dtype=np.float32) for r in oh_list], axis=0)
+                else:
+                    oh_array = np.zeros((0,), dtype=np.float32)
+                X_processed = np.concatenate([num_array, oh_array], axis=0).reshape(1, -1)
+                print("Applied portable preprocessor spec successfully.")
+            else:
+                print(f"Portable preprocessor spec not found at {spec_path}.")
+        except Exception as e:
+            print(f"Warning: portable preprocessor spec application failed: {e}")
 
     # Try to load and apply ensembles in order of preference
     # 1) TopKMean: lightweight JSON bundle with aligned_keys and per-key (mean,std) for z-scoring
@@ -369,11 +427,12 @@ def interf0_handler():
                         z = (float(base_pred_map[k]) - float(mu)) / float(sd)
                         feats.append(z)
                         used.append(k)
-                if len(feats) >= 2:
+                # Proceed if we have at least one z-scored base prediction; this enables MLP-only fallback
+                if len(feats) >= 1:
                     ensemble_score = float(sum(feats) / len(feats))
                     print(f"TopKMean used keys: {used}")
                 else:
-                    print("TopKMean bundle present but insufficient base predictions; falling back.")
+                    print("TopKMean bundle present but no usable base predictions; falling back.")
             else:
                 print("TopKMean bundle found but missing/insufficient aligned_keys.")
         else:
