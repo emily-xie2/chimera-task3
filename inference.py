@@ -310,16 +310,18 @@ def interf0_handler():
         c_tensor = torch.from_numpy(clinical_vec).unsqueeze(0).float().to(device)
         mlp_risk_score = model(c_tensor).squeeze().item()
 
-    # TopKMean ensemble (required). Only portable base predictions are allowed.
-    topk_path = RESOURCE_PATH / "topkmean.json"
-    if not topk_path.exists():
-        raise RuntimeError(f"Required TopKMean bundle not found at {topk_path}")
-    with open(topk_path, "r") as f:
-        topk = json.load(f)
-    aligned_keys = topk.get("aligned_keys", [])
-    stats = topk.get("stats", {})
+    # Require MLP+RSF ensemble bundle (no fallback)
+    stats = {}
+    aligned_keys = []
+    mlp_rsf_path = RESOURCE_PATH / "mlp_rsf_ensemble.json"
+    if not mlp_rsf_path.exists():
+        raise RuntimeError(f"Required MLP+RSF ensemble bundle not found at {mlp_rsf_path}")
+    with open(mlp_rsf_path, "r") as f:
+        bundle = json.load(f)
+    aligned_keys = bundle.get("aligned_keys", [])
+    stats = bundle.get("stats", {})
     if not isinstance(aligned_keys, list) or not aligned_keys:
-        raise RuntimeError("TopKMean bundle missing 'aligned_keys'")
+        raise RuntimeError("MLP+RSF ensemble bundle missing 'aligned_keys'")
 
     # Build portable base predictions
     base_pred_map: dict[str, float] = {}
@@ -366,7 +368,7 @@ def interf0_handler():
     supported = ['mlp', 'coxph', 'rsf']
     used_keys = [k for k in aligned_keys if k in supported]
     if len(used_keys) < 2:
-        raise RuntimeError("TopKMean must include at least two supported keys: 'mlp' and 'coxph'")
+        raise RuntimeError("Ensemble must include at least two supported keys, e.g., 'mlp' and 'coxph' or 'rsf'")
     # Assemble z-scored features for used keys
     feats = []
     for k in used_keys:
@@ -376,7 +378,7 @@ def interf0_handler():
         sd = float(sd) if (isinstance(sd, (int, float)) and float(sd) > 1e-8) else 1.0
         feats.append((float(base_pred_map[k]) - float(mu)) / sd)
     final_score = float(sum(feats) / len(feats))
-    print(f"TopKMean used keys: {used_keys}")
+    print(f"Ensemble used keys: {used_keys}")
 
     # Map final_score to [0, 80] using sigmoid
     prob = 1.0 / (1.0 + math.exp(-final_score))
