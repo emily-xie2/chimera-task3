@@ -1,0 +1,21 @@
+project: Clinical-Survival-Analysis-Stratified
+seed: 42
+n_splits: 10
+batch_size: 16
+num_epochs: 50
+learning_rate: 5.0e-5
+hidden_dim: 64
+dropout: 0.4
+
+# data/paths
+data_dir: data
+results_scope: clinical
+resources_dir: resources  # relative to repo root by default
+
+# columns
+survival_time_col: Time_to_prog_or_FUend
+survival_event_col: progression
+
+# logging
+wandb_watch: false
+log_freq: 5
